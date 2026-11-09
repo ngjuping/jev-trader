@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections import deque
@@ -17,6 +18,7 @@ from jev_trader.policy.engine import compose_action
 from jev_trader.pricing.avellaneda_stoikov import compute_quote
 from jev_trader.risk.limits import RiskEngine, RiskState, Verdict
 from jev_trader.state.features import FeatureEngine
+from jev_trader.state.micro import NEUTRAL, MicroSignal, MicroSignalEngine
 from jev_trader.state.snapshot import MarketState, build_market_state
 from jev_trader.types import Action, ActionKind, JudgmentSet, Order
 
@@ -43,6 +45,9 @@ class LoopStats:
     equity: float = 0.0
     actions: dict[str, int] = field(default_factory=dict)
     latencies_ms: list[float] = field(default_factory=list)
+    micro_one_sided_pulls: int = 0
+    micro_toxic_pauses: int = 0
+    micro_toxic_events: int = 0
 
     def summary(self) -> dict[str, Any]:
         latencies = sorted(self.latencies_ms)
@@ -71,6 +76,9 @@ class LoopStats:
             "unrealized": round(self.unrealized, 4),
             "fees": round(self.fees, 4),
             "equity": round(self.equity, 4),
+            "micro_one_sided_pulls": self.micro_one_sided_pulls,
+            "micro_toxic_pauses": self.micro_toxic_pauses,
+            "micro_toxic_events": self.micro_toxic_events,
         }
 
 
@@ -97,6 +105,22 @@ class TradingLoop:
         self._fills = fills
         self._risk = RiskEngine(settings.risk)
         self._features = FeatureEngine()
+        pricing = settings.pricing
+        self._micro = MicroSignalEngine(
+            ofi_window_s=pricing.ofi_window_s,
+            obi_levels=pricing.obi_levels,
+            w_ofi=pricing.signal_w_ofi,
+            w_obi=pricing.signal_w_obi,
+            trade_window_s=pricing.toxic_trade_window_s,
+            trade_min_samples=pricing.toxic_trade_min_samples,
+            big_trade_quantile=pricing.toxic_trade_quantile,
+            big_trade_median_mult=pricing.toxic_trade_median_mult,
+            jump_bps=pricing.toxic_jump_bps,
+            pause_s=pricing.toxic_pause_s,
+        )
+        self._micro_signal: MicroSignal = NEUTRAL
+        self._last_book: Any = None
+        self._last_micro_quote: dict[str, Any] = {}
         self._stats = LoopStats()
         self._peak_equity = settings.starting_cash
         self._api_errors = 0
@@ -144,6 +168,10 @@ class TradingLoop:
         )
 
         features = self._features.update(event)
+        self._micro_signal = self._micro.update(event)
+        self._last_book = event.book
+        if self._micro_signal.toxic:
+            stats.micro_toxic_events += 1
         health = self._venue.health()
         state = build_market_state(
             event,
@@ -205,6 +233,7 @@ class TradingLoop:
         await self._execute(action, state, reduce_only)
 
         stats.actions[action.kind.value] = stats.actions.get(action.kind.value, 0) + 1
+        self._log_micro(event.block, state)
 
         if self._calibration is not None:
             decision_id = self._calibration.record_decision(
@@ -274,31 +303,92 @@ class TradingLoop:
             multiplier = self._settings.policy.wide_spread_multiplier
         else:
             multiplier = 1.0
+        pricing = self._settings.pricing
+        micro = self._micro_signal
+        if micro.paused(state.ts):
+            self._stats.micro_toxic_pauses += 1
+            self._last_micro_quote = {"pulled": "both", "reason": micro.toxic_reason or "toxic pause"}
+            return []
         max_position = max(self._settings.risk.max_position, 1e-9)
+        center = state.mid
+        if pricing.use_microprice and state.microprice > 0:
+            center = state.microprice
+        center += center * pricing.micro_alpha_bps * micro.signal / 10_000.0
         quote = compute_quote(
-            mid=state.mid,
+            mid=center,
             inventory=state.inventory / max_position,
-            sigma=max(state.realized_vol_short, 1e-9),
-            tau=self._settings.pricing.horizon_s,
-            gamma=self._settings.pricing.gamma,
-            kappa=self._settings.pricing.kappa,
-            min_half_spread=state.mid * self._settings.pricing.min_half_spread_bps / 10_000.0,
+            sigma=max(state.realized_vol_short * state.mid, 1e-9),  # price units ($/sqrt(s))
+            tau=pricing.horizon_s,
+            gamma=pricing.gamma,
+            kappa=pricing.kappa,
+            min_half_spread=state.mid * pricing.min_half_spread_bps / 10_000.0,
             skew=action.skew,
             half_spread_multiplier=multiplier,
-            tick_size=self._settings.pricing.tick_size,
+            tick_size=pricing.tick_size,
         )
+        bid_price, ask_price = quote.bid, quote.ask
+        book = self._last_book
+        if pricing.clamp_to_touch and book is not None and getattr(book, "two_sided", False):
+            bid_price = min(bid_price, book.bids[0].price)
+            ask_price = max(ask_price, book.asks[0].price)
         size = self._settings.risk.max_order_size * action.size_scale
         notional_cap = self._settings.risk.max_notional
         if notional_cap > 0 and state.mid > 0:
             size = min(size, notional_cap / state.mid)
         if size <= 0:
             return []
+        want_bid = not reduce_only or state.inventory < 0
+        want_ask = not reduce_only or state.inventory > 0
+        pulled = ""
+        threshold = pricing.one_sided_threshold
+        if threshold > 0 and abs(micro.signal) > threshold:
+            # Strong sell pressure -> our bid gets picked off; strong buy -> our ask.
+            if micro.signal < 0 and want_bid:
+                want_bid = False
+                pulled = "bid"
+            elif micro.signal > 0 and want_ask:
+                want_ask = False
+                pulled = "ask"
+            if pulled:
+                self._stats.micro_one_sided_pulls += 1
+        self._last_micro_quote = {
+            "pulled": pulled,
+            "center": round(center, 2),
+            "bid": round(bid_price, 2) if want_bid else None,
+            "ask": round(ask_price, 2) if want_ask else None,
+        }
         orders: list[Order] = []
-        if not reduce_only or state.inventory < 0:
-            orders.append(Order(side="buy", price=quote.bid, size=size))
-        if not reduce_only or state.inventory > 0:
-            orders.append(Order(side="sell", price=quote.ask, size=size))
+        if want_bid:
+            orders.append(Order(side="buy", price=bid_price, size=size))
+        if want_ask:
+            orders.append(Order(side="sell", price=ask_price, size=size))
         return orders
+
+    def _log_micro(self, block: int, state: MarketState) -> None:
+        every = self._settings.pricing.micro_log_every_blocks
+        micro = self._micro_signal
+        if every <= 0 or (block % every and not micro.toxic):
+            return
+        stats = self._stats
+        payload = {
+            "block": block,
+            "mid": round(state.mid, 2),
+            "micro": round(micro.microprice, 2),
+            "ofi": round(micro.ofi, 6),
+            "ofi_norm": round(micro.ofi_norm, 4),
+            "obi": round(micro.obi, 4),
+            "s": round(micro.signal, 4),
+            "jump_bps": round(micro.jump_bps, 3),
+            "toxic": micro.toxic_reason,
+            "paused": micro.paused(state.ts),
+            "inv": state.inventory,
+            "quote": self._last_micro_quote,
+            "pulls": stats.micro_one_sided_pulls,
+            "toxic_pauses": stats.micro_toxic_pauses,
+            "toxic_events": stats.micro_toxic_events,
+            "equity": round(self._venue.equity(), 4),
+        }
+        logger.info("micro %s", json.dumps(payload, separators=(",", ":")))
 
     async def _guarded(self, awaitable: Any) -> bool:
         try:

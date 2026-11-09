@@ -70,6 +70,28 @@ class PricingConfig(BaseModel):
     horizon_s: float = 60.0
     min_half_spread_bps: float = 1.0
     tick_size: float = 0.01
+    # --- anti-adverse-selection (local microstructure, computed every block) ---
+    # 1. center the reservation price on the top-of-book microprice instead of mid.
+    use_microprice: bool = True
+    # 2. OFI (CKS) over a rolling window + OBI blended into s in [-1, 1];
+    #    the center shifts by alpha_bps * s toward the predicted direction.
+    micro_alpha_bps: float = 1.5
+    ofi_window_s: float = 3.0
+    obi_levels: int = 3
+    signal_w_ofi: float = 0.5
+    signal_w_obi: float = 0.5
+    # 3. one-sided pull: |s| > threshold drops the side that would be picked off.
+    one_sided_threshold: float = 0.6
+    # 4. toxicity pause: big aggressive trade or sharp mid jump between blocks pulls both sides.
+    toxic_pause_s: float = 1.5
+    toxic_jump_bps: float = 3.0
+    toxic_trade_quantile: float = 0.95
+    toxic_trade_median_mult: float = 3.0
+    toxic_trade_window_s: float = 300.0
+    toxic_trade_min_samples: int = 50
+    # never quote through the touch (avoids post-only rejects after skew/shift).
+    clamp_to_touch: bool = True
+    micro_log_every_blocks: int = 30
 
 
 class Settings(BaseSettings):
