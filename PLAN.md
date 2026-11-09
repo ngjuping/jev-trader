@@ -95,6 +95,21 @@ in simulation or the strategy is rejected.
 
 **Acceptance:** published backtest report in `docs/` with the four-way comparison.
 
+## Phase 4a — Bitfinex dedicated sub-account
+
+The owner chose small live on a separate Bitfinex sub-account (2026-11-09).
+The main account, which runs an unrelated directional trader, is not a target:
+live mode requires `BFX_SUB_API_KEY` / `BFX_SUB_API_SECRET` and refuses to start
+when the account holds exposure this process does not own.
+
+- [x] `BitfinexVenue` (`VenueAdapter`): P0 book len 25, trades, post-only flag 4096, cancel/replace, cancel-all, fills, REST reconcile, conf precision
+- [x] `BitfinexFeed` block clock (`JEV_BLOCK_MS`) into the existing state engine; no quotes while the book is unsynced
+- [x] `live` (mandatory `--max-notional`) and `shadow` (real book, paper fills, no orders)
+- [x] Kill switch: hard limits, repeated API errors, blind book, SIGTERM → cancel + reduce-only flatten
+- [x] Account fees in PnL, calibration triples, fills ledger with 1/5/30s markouts
+- [x] systemd unit template; secrets only via env
+- [ ] Operator runs shadow, then small live, on the sub-account (not done from this repo)
+
 ## Phase 4 — Live venue adapter
 
 - [ ] Venue adapter interface (`VenueAdapter` protocol) hardened for async IO

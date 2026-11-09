@@ -30,6 +30,7 @@ class RiskState:
     data_age_s: float = 0.0
     decision_latency_ms: float = 0.0
     api_errors: int = 0
+    mid: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +76,20 @@ class RiskEngine:
             escalate(Verdict.KILL, f"position {state.position:.2f} beyond kill multiplier")
         elif abs(state.position) > limits.max_position:
             escalate(Verdict.REDUCE_ONLY, f"position {state.position:.2f} > max")
+
+        if limits.max_notional > 0 and state.mid > 0:
+            notional = abs(state.position) * state.mid
+            kill_at = limits.max_notional * limits.kill_position_multiplier
+            if notional > kill_at:
+                escalate(
+                    Verdict.KILL,
+                    f"notional {notional:.2f} > {kill_at:.2f}",
+                )
+            elif notional > limits.max_notional:
+                escalate(
+                    Verdict.REDUCE_ONLY,
+                    f"notional {notional:.2f} > {limits.max_notional:.2f}",
+                )
 
         if state.inventory_age_s > limits.max_inventory_age_s:
             escalate(
