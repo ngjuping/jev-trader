@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,6 +21,8 @@ class RiskConfig(BaseModel):
     max_decision_latency_ms: float = 250.0
     max_api_errors: int = 5
     kill_position_multiplier: float = 1.5
+    # Quote-currency cap. 0 disables it. `live` sets this from --max-notional.
+    max_notional: float = 0.0
 
 
 class PolicyConfig(BaseModel):
@@ -35,6 +38,28 @@ class PolicyConfig(BaseModel):
     low_confidence_scale: float = 0.5
     wide_spread_multiplier: float = 2.0
     kelly_cap: float = 0.25
+
+
+class BitfinexConfig(BaseModel):
+    """Bitfinex connectivity. Secrets are NOT here; they are `BFX_SUB_*` env vars."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    symbol: str = "tBTCF0:USTF0"
+    # Empty derives spot vs perp from the symbol (`F0` => perp).
+    market: Literal["", "spot", "perp"] = ""
+    public_ws_url: str = "wss://api-pub.bitfinex.com/ws/2"
+    private_ws_url: str = "wss://api.bitfinex.com/ws/2"
+    rest_url: str = "https://api.bitfinex.com"
+    public_rest_url: str = "https://api-pub.bitfinex.com"
+    # Decimal fee rates. None reads the account summary (live) or the conservative default.
+    maker_fee_rate: float | None = None
+    taker_fee_rate: float | None = None
+    leverage: int = Field(default=1, ge=1, le=100)
+    reconcile_interval_s: float = 30.0
+    order_ack_timeout_s: float = 5.0
+    max_blind_s: float = 30.0
+    min_order_size: float | None = None
 
 
 class PricingConfig(BaseModel):
@@ -58,20 +83,40 @@ class Settings(BaseSettings):
     typesafe_api_key: SecretStr | None = Field(
         default=None, validation_alias="TYPESAFE_API_KEY"
     )
+    # Dedicated sub-account only. Never the main account that runs the directional trader.
+    bfx_sub_api_key: SecretStr | None = Field(default=None, validation_alias="BFX_SUB_API_KEY")
+    bfx_sub_api_secret: SecretStr | None = Field(
+        default=None, validation_alias="BFX_SUB_API_SECRET"
+    )
     jev_model: str = "jev-latest"
     block_ms: int = 300
     decision_timeout_s: float = 0.25
     calibration_horizon_blocks: int = 10
     log_path: Path = Path("data/calibration.jsonl")
+    fills_path: Path = Path("data/fills.jsonl")
     starting_cash: float = 10_000.0
     fee_bps: float = 1.0
 
     risk: RiskConfig = Field(default_factory=RiskConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     pricing: PricingConfig = Field(default_factory=PricingConfig)
+    bfx: BitfinexConfig = Field(default_factory=BitfinexConfig)
 
     @property
     def has_api_key(self) -> bool:
         return self.typesafe_api_key is not None and bool(
             self.typesafe_api_key.get_secret_value()
         )
+
+    def subaccount_keys(self) -> tuple[str, str] | None:
+        key = _secret_value(self.bfx_sub_api_key)
+        secret = _secret_value(self.bfx_sub_api_secret)
+        if not key or not secret:
+            return None
+        return key, secret
+
+
+def _secret_value(value: SecretStr | None) -> str:
+    if value is None:
+        return ""
+    return value.get_secret_value().strip()

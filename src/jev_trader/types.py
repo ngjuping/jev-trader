@@ -60,6 +60,9 @@ class Fill:
     price: float
     size: float
     fee: float
+    ts: float | None = None
+    order_id: str | None = None
+    trade_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -22,6 +22,7 @@ from jev_trader.execution.paper import PaperVenue
 from jev_trader.feeds.synthetic import SyntheticFeed
 from jev_trader.judgment.client import JevClient
 from jev_trader.judgment.fallback import HeuristicJudge
+from jev_trader.loop.bitfinex_run import run_bitfinex
 from jev_trader.loop.engine import TradingLoop
 
 
@@ -41,6 +42,23 @@ def _build_parser() -> argparse.ArgumentParser:
     paper.add_argument("--log", type=Path, default=None)
     paper.add_argument("--no-log", action="store_true")
 
+    live = sub.add_parser(
+        "live",
+        help="quote on Bitfinex with the dedicated sub-account keys",
+    )
+    _add_market_args(live, require_notional=True)
+    live.add_argument(
+        "--adopt",
+        action="store_true",
+        help="take over an existing position and orders on this symbol only",
+    )
+
+    shadow = sub.add_parser(
+        "shadow",
+        help="real Bitfinex book, paper fills, no orders",
+    )
+    _add_market_args(shadow, require_notional=False)
+
     calibrate = sub.add_parser("calibrate", help="calibration report from logged triples")
     calibrate.add_argument("--log", type=Path, default=None)
     calibrate.add_argument(
@@ -54,15 +72,49 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_market_args(parser: argparse.ArgumentParser, *, require_notional: bool) -> None:
+    parser.add_argument("--symbol", default=None, help="default tBTCF0:USTF0 (or JEV_BFX__SYMBOL)")
+    parser.add_argument(
+        "--max-notional",
+        type=float,
+        required=require_notional,
+        help="hard cap on position and order notional, in quote currency",
+    )
+    parser.add_argument(
+        "--blocks",
+        type=int,
+        default=None,
+        help="stop after N blocks; default runs until signal",
+    )
+    parser.add_argument("--log", type=Path, default=None)
+    parser.add_argument("--fills-log", type=Path, default=None)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "paper":
         return asyncio.run(_run_paper(args))
+    if args.command in {"live", "shadow"}:
+        return asyncio.run(_run_bitfinex(args))
     if args.command == "calibrate":
         return _run_calibrate(args)
     if args.command == "models":
         return _run_models()
     return 1
+
+
+async def _run_bitfinex(args: argparse.Namespace) -> int:
+    settings = Settings()
+    return await run_bitfinex(
+        settings,
+        mode=args.command,
+        max_notional=args.max_notional,
+        symbol=args.symbol,
+        adopt=bool(getattr(args, "adopt", False)),
+        blocks=args.blocks,
+        log_path=args.log,
+        fills_path=args.fills_log,
+    )
 
 
 async def _run_paper(args: argparse.Namespace) -> int:

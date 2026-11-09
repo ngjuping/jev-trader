@@ -18,6 +18,8 @@ dependencies = [
     "numpy>=1.26",
     "pydantic>=2.12",
     "pydantic-settings>=2.6",
+    "httpx>=0.27",
+    "websockets>=13",
 ]
 
 [project.scripts]
