@@ -60,6 +60,7 @@ class BitfinexVenue:
         leverage: int | None = 1,
         ack_timeout_s: float = 5.0,
         dust: float = 1e-8,
+        max_position: float | None = None,
     ) -> None:
         self.symbol = symbol
         self._market = market
@@ -72,6 +73,8 @@ class BitfinexVenue:
         self._leverage = leverage if market == "perp" else None
         self._ack_timeout_s = ack_timeout_s
         self._dust = dust
+        self._max_position = max_position
+        self._orders_blind = False
         self._account = AccountBook(symbol)
         self._book: OrderBook | None = None
         self._book_ts = 0.0
@@ -95,6 +98,11 @@ class BitfinexVenue:
     @property
     def halted(self) -> bool:
         return self._halted
+
+    @property
+    def orders_blind(self) -> bool:
+        """True after an order-ack or cancel timeout until quotes are flat again."""
+        return self._orders_blind
 
     @property
     def fees(self) -> FeeSchedule:
@@ -187,10 +195,13 @@ class BitfinexVenue:
     async def place(self, order: Order) -> str:
         if self._halted:
             raise OrderRejected("halted")
+        if self._orders_blind:
+            raise OrderRejected("orders blind after timeout")
         try:
             self._require_fresh_book()
             normalized = self._normalize(order)
             self._reject_if_crossing(normalized)
+            self._reject_if_inventory_breach(normalized)
         except OrderRejected:
             self._attempts += 1
             self._rejects += 1
@@ -217,9 +228,13 @@ class BitfinexVenue:
     async def replace(self, order_id: str, order: Order) -> str:
         if self._halted:
             raise OrderRejected("halted")
+        if self._orders_blind:
+            # Never replace after a timeout — pull only until synced.
+            raise OrderRejected("orders blind after timeout")
         self._require_fresh_book()
         normalized = self._normalize(order)
         self._reject_if_crossing(normalized)
+        self._reject_if_inventory_breach(normalized)
         body = replace_body(
             order_id=int(order_id),
             side=normalized.side,
@@ -241,6 +256,13 @@ class BitfinexVenue:
         """Cancel/replace resting quotes so they match `orders`. Empty pulls everything."""
         if self._halted or self._book_is_stale():
             await self.cancel_all()
+            return
+        if self._orders_blind:
+            # Blind mode: cancel both sides only. Never place/replace until flat.
+            await self.cancel_all()
+            if not self._account.orders:
+                self._orders_blind = False
+                logger.info("orders blind cleared; resting quotes flat")
             return
         desired: dict[str, Order] = {}
         for order in orders:
@@ -379,6 +401,8 @@ class BitfinexVenue:
             )
         except TimeoutError:
             self._account.api_errors += 1
+            self._orders_blind = True
+            logger.error("cancel timed out; entering orders blind (no replace until flat)")
             raise BitfinexAPIError("cancel timed out") from None
 
     async def _request(
@@ -400,6 +424,11 @@ class BitfinexVenue:
             return await asyncio.wait_for(future, self._ack_timeout_s)
         except TimeoutError:
             self._account.api_errors += 1
+            self._orders_blind = True
+            logger.error("order ack timed out; entering orders blind and pulling quotes")
+            # Best-effort cancel both sides; ignore nested failures while blind.
+            with contextlib.suppress(Exception):
+                await self._cancel_ids_best_effort(set(self._account.orders))
             raise BitfinexAPIError("order ack timed out") from None
         except BitfinexAPIError:
             self._account.api_errors += 1
@@ -486,6 +515,36 @@ class BitfinexVenue:
             max_size=self._max_order_size,
         )
         return Order(side=order.side, price=price, size=size, post_only=True)
+
+    def _reject_if_inventory_breach(self, order: Order) -> None:
+        """Hard cap: projected inventory including this order must stay within max_position."""
+        if self._max_position is None or self._max_position <= 0:
+            return
+        inv = self._account.position
+        open_buy = sum(
+            o.remaining for o in self._account.orders.values()
+            if o.flags & FLAG_REDUCE_ONLY == 0 and o.side == "buy"
+        )
+        open_sell = sum(
+            o.remaining for o in self._account.orders.values()
+            if o.flags & FLAG_REDUCE_ONLY == 0 and o.side == "sell"
+        )
+        if order.side == "buy":
+            projected = inv + open_buy + order.size
+        else:
+            projected = inv - open_sell - order.size
+        if abs(projected) > self._max_position + 1e-12:
+            raise OrderRejected(
+                f"projected inventory {projected:.8g} exceeds max_position {self._max_position}"
+            )
+
+    async def _cancel_ids_best_effort(self, ids: set[int]) -> None:
+        """Fire cancel without waiting for ack (used after an ack timeout)."""
+        pending = {order_id for order_id in ids if order_id in self._account.orders}
+        if not pending:
+            return
+        with contextlib.suppress(Exception):
+            await self._dispatch([0, "oc_multi", None, {"id": sorted(pending)}])
 
     def _reject_if_crossing(self, order: Order) -> None:
         book = self._book

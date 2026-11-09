@@ -109,3 +109,53 @@ class RiskEngine:
             )
 
         return RiskVerdict(verdict=verdict, breaches=tuple(breaches))
+
+
+def allowed_quote_sides(
+    inventory: float,
+    max_position: float,
+    *,
+    open_buy: float = 0.0,
+    open_sell: float = 0.0,
+    eps: float = 1e-12,
+) -> tuple[bool, bool]:
+    """Hard inventory gate for quoting.
+
+    Returns ``(want_bid, want_ask)``. When ``|inventory|`` is already at or past
+    ``max_position``, only the reducing side is allowed. Open resting buys/sells
+    count toward projected inventory so an adopt/fill race cannot push past the
+    cap by leaving an increasing-side quote live.
+    """
+    if max_position <= 0:
+        return False, False
+    want_bid = True
+    want_ask = True
+    if inventory >= max_position - eps:
+        want_bid = False
+    if inventory <= -max_position + eps:
+        want_ask = False
+    # Projected if resting increasing-side orders fill.
+    if inventory + max(open_buy, 0.0) > max_position + eps:
+        want_bid = False
+    if inventory - max(open_sell, 0.0) < -max_position - eps:
+        want_ask = False
+    return want_bid, want_ask
+
+
+def clamp_order_size_for_cap(
+    side: str,
+    size: float,
+    inventory: float,
+    max_position: float,
+    *,
+    open_buy: float = 0.0,
+    open_sell: float = 0.0,
+) -> float:
+    """Shrink an order so filling it cannot push ``|inventory|`` past the cap."""
+    if size <= 0 or max_position <= 0:
+        return 0.0
+    if side == "buy":
+        room = max_position - (inventory + max(open_buy, 0.0))
+    else:
+        room = max_position + (inventory - max(open_sell, 0.0))
+    return max(0.0, min(size, room))
