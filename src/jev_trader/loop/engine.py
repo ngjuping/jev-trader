@@ -16,7 +16,7 @@ from jev_trader.feeds.base import Feed
 from jev_trader.judgment.fallback import HeuristicJudge
 from jev_trader.policy.engine import compose_action
 from jev_trader.pricing.avellaneda_stoikov import compute_quote
-from jev_trader.risk.limits import RiskEngine, RiskState, Verdict
+from jev_trader.risk.limits import RiskEngine, RiskState, Verdict, allowed_quote_sides, clamp_order_size_for_cap
 from jev_trader.state.features import FeatureEngine
 from jev_trader.state.micro import NEUTRAL, MicroSignal, MicroSignalEngine
 from jev_trader.state.snapshot import MarketState, build_market_state
@@ -276,7 +276,11 @@ class TradingLoop:
         return action, judgments, judgments.source, latency_ms
 
     async def _execute(self, action: Action, state: MarketState, reduce_only: bool) -> None:
-        orders = self._quote_orders(action, state, reduce_only)
+        # After an ack/cancel timeout the venue is orders-blind: pull only, no new quotes.
+        if getattr(self._venue, "orders_blind", False):
+            orders: list[Order] = []
+        else:
+            orders = self._quote_orders(action, state, reduce_only)
         sync = getattr(self._venue, "sync_quotes", None)
         if sync is not None:
             await self._guarded(sync(tuple(orders)))
@@ -339,6 +343,24 @@ class TradingLoop:
             return []
         want_bid = not reduce_only or state.inventory < 0
         want_ask = not reduce_only or state.inventory > 0
+        # Hard inventory gate: projected inv (incl. open quotes) must stay within max_position.
+        open_buy = 0.0
+        open_sell = 0.0
+        open_fn = getattr(self._venue, "open_orders", None)
+        if callable(open_fn):
+            for resting in open_fn():
+                if resting.side == "buy":
+                    open_buy += resting.size
+                else:
+                    open_sell += resting.size
+        gate_bid, gate_ask = allowed_quote_sides(
+            state.inventory,
+            max_position,
+            open_buy=open_buy,
+            open_sell=open_sell,
+        )
+        want_bid = want_bid and gate_bid
+        want_ask = want_ask and gate_ask
         pulled = ""
         threshold = pricing.one_sided_threshold
         if threshold > 0 and abs(micro.signal) > threshold:
@@ -359,9 +381,19 @@ class TradingLoop:
         }
         orders: list[Order] = []
         if want_bid:
-            orders.append(Order(side="buy", price=bid_price, size=size))
+            bid_size = clamp_order_size_for_cap(
+                "buy", size, state.inventory, max_position,
+                open_buy=open_buy, open_sell=open_sell,
+            )
+            if bid_size > 0:
+                orders.append(Order(side="buy", price=bid_price, size=bid_size))
         if want_ask:
-            orders.append(Order(side="sell", price=ask_price, size=size))
+            ask_size = clamp_order_size_for_cap(
+                "sell", size, state.inventory, max_position,
+                open_buy=open_buy, open_sell=open_sell,
+            )
+            if ask_size > 0:
+                orders.append(Order(side="sell", price=ask_price, size=ask_size))
         return orders
 
     def _log_micro(self, block: int, state: MarketState) -> None:

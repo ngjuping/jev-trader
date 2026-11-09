@@ -359,6 +359,7 @@ async def _trade(
             max_stale_s=settings.risk.max_stale_data_age_s,
             leverage=settings.bfx.leverage,
             ack_timeout_s=settings.bfx.order_ack_timeout_s,
+            max_position=settings.risk.max_position,
         )
         _seed_live_venue(
             venue,
