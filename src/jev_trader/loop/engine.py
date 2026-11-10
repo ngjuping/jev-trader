@@ -318,17 +318,32 @@ class TradingLoop:
         if pricing.use_microprice and state.microprice > 0:
             center = state.microprice
         center += center * pricing.micro_alpha_bps * micro.signal / 10_000.0
+        q_norm = state.inventory / max_position
+        sigma = max(state.realized_vol_short * state.mid, 1e-9)  # price units ($/sqrt(s))
+        fee_bps = max(float(self._settings.fee_bps), 0.0)
+        maker_rate = self._settings.bfx.maker_fee_rate
+        if maker_rate is not None:
+            fee_bps = max(fee_bps, float(maker_rate) * 10_000.0)
+        min_bps = max(float(pricing.min_half_spread_bps), fee_bps)
+        max_bps = max(float(getattr(pricing, "max_half_spread_bps", 50.0)), min_bps)
+        min_half = state.mid * min_bps / 10_000.0
+        max_half = state.mid * max_bps / 10_000.0
+        quote_mode = str(getattr(pricing, "quote_mode", "fixed") or "fixed")
         quote = compute_quote(
             mid=center,
-            inventory=state.inventory / max_position,
-            sigma=max(state.realized_vol_short * state.mid, 1e-9),  # price units ($/sqrt(s))
+            inventory=q_norm,
+            sigma=sigma,
             tau=pricing.horizon_s,
             gamma=pricing.gamma,
             kappa=pricing.kappa,
-            min_half_spread=state.mid * pricing.min_half_spread_bps / 10_000.0,
+            min_half_spread=min_half,
             skew=action.skew,
             half_spread_multiplier=multiplier,
             tick_size=pricing.tick_size,
+            mode=quote_mode,
+            intensity_a=float(getattr(pricing, "intensity_a", 0.003204)),
+            intensity_k_rel=float(getattr(pricing, "intensity_k_rel", 1493.2)),
+            max_half_spread=max_half,
         )
         bid_price, ask_price = quote.bid, quote.ask
         book = self._last_book
@@ -379,6 +394,22 @@ class TradingLoop:
             "bid": round(bid_price, 2) if want_bid else None,
             "ask": round(ask_price, 2) if want_ask else None,
         }
+        every = int(getattr(pricing, "quote_log_every_blocks", 1) or 1)
+        if every > 0 and (self._stats.blocks % every == 0):
+            payload = {
+                "sigma": round(sigma, 6),
+                "gamma": pricing.gamma,
+                "A": round(quote.intensity_a, 8),
+                "k": round(quote.intensity_k, 8),
+                "q": round(q_norm, 4),
+                "r": round(quote.reservation, 2),
+                "d_bid": round(state.mid - bid_price, 2),
+                "d_ask": round(ask_price - state.mid, 2),
+                "mid": round(state.mid, 2),
+                "half": round(quote.half_spread, 2),
+                "mode": quote.mode,
+            }
+            logger.info("glft %s", json.dumps(payload, separators=(",", ":")))
         orders: list[Order] = []
         if want_bid:
             bid_size = clamp_order_size_for_cap(

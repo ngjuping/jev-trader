@@ -69,6 +69,13 @@ class PricingConfig(BaseModel):
     kappa: float = 100.0
     horizon_s: float = 60.0
     min_half_spread_bps: float = 1.0
+    # "glft" = Guéant–Lehalle–Fernandez-Tapia quotes; "fixed"/"as" = previous A-S + floor.
+    quote_mode: str = "fixed"
+    # λ(δ) = A * exp(-k_rel * δ/mid). Defaults are the 2026-11-11 jev-mm fill calibration.
+    intensity_a: float = 0.003204
+    intensity_k_rel: float = 1493.2
+    max_half_spread_bps: float = 50.0
+    quote_log_every_blocks: int = 1
     tick_size: float = 0.01
     # --- anti-adverse-selection (local microstructure, computed every block) ---
     # 1. center the reservation price on the top-of-book microprice instead of mid.
